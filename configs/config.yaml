@@ -1,0 +1,41 @@
+# ============================================================
+#  Drivable Area Detection — Configuration
+# ============================================================
+
+project:
+  name: "Drivable Area Detection"
+  version: "1.0.0"
+
+paths:
+  dataset_dir: "dataset"
+  images_pickle: "dataset/images_3000_160.p"
+  labels_pickle: "dataset/labels_3000_160.p"
+  model_checkpoint: "checkpoints/lane_segment.pth"
+  log_dir: "logs"
+  output_dir: "outputs"
+
+data:
+  image_height: 80
+  image_width: 160
+  num_classes: 3           # green=bg, red=drivable, blue=adjacent
+  train_split: 0.7
+  val_split: 0.3
+  augment: true            # horizontal flip augmentation
+
+model:
+  in_channels: 3
+  out_channels: 3
+  features: [64, 128, 256, 512]
+
+training:
+  epochs: 50
+  batch_size: 16
+  learning_rate: 0.001
+  optimizer: "adam"
+  loss: "cross_entropy"
+  save_best: true
+  log_interval: 1          # log every N epochs
+
+inference:
+  device: "auto"           # "auto", "cpu", or "cuda"
+  confidence_threshold: 0.5
