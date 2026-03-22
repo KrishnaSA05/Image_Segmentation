@@ -28,7 +28,7 @@ drivable_area_detection/
 │       ├── logger.py        ← Centralised logging (console + file)
 │       └── helpers.py       ← Shared utilities
 ├── configs/
-│   └── config.yaml          ← All hyperparameters (no hardcoding)
+│   └── config.yaml          ← All hyperparameters
 ├── tests/
 │   └── test_model.py        ← 10 pytest unit tests
 ├── train.py                 ← Training entry-point
