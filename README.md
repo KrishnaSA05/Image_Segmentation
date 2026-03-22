@@ -2,6 +2,9 @@
 
 A deep learning project that detects **drivable areas** and **adjacent lanes** in road images and videos using a U-Net segmentation model trained on the BDD100K dataset.
 
+<div align="Left">
+    <img src="Readme Files\Lane_detection_gif.gif" width="1000" height="400">
+</div>
 ---
 
 ## 📌 Project Overview
@@ -79,6 +82,9 @@ Output (3, H, W)                ← 3-channel RGB segmentation mask
 
 > ⚠️ The model outputs a **direct RGB image** — not class probabilities. Do NOT apply softmax or argmax on the output. Use the `rgb_channel()` thresholding pipeline instead (see Prediction section).
 
+<div align="Left">
+    <img src="Readme Files/Unet.png" width="1000" height="400">
+</div>
 ---
 
 ## 🗂️ Dataset
@@ -94,6 +100,10 @@ Output (3, H, W)                ← 3-channel RGB segmentation mask
 - **Format**: Pickle files (`images3000_160.p`, `labels3000_160.p`)
 
 To download the full dataset, visit: https://bdd-data.berkeley.edu/
+
+<div align="Left">
+    <img src="Readme Files/dataset_sample.png" width="1000" height="400">
+</div>
 
 ---
 ## ⚙️ Configuration
