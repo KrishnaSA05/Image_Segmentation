@@ -285,6 +285,21 @@ pytest tests/
 
 The red region shows the detected drivable area, and blue shows adjacent drivable lanes — both overlaid on the original dashcam image.
 
+<div align="Left">
+    <img src="Readme Files/output_1.png" width="1000" height="400">
+</div>
+
+Furthermore, The mask and original image is blended using cv2.bitwise_and technique.
+
+<div align="Left">
+    <img src="Readme Files/output_2.png" width="1000" height="400">
+</div>
+
+Testing on sample video:
+
+<div align="Left">
+    <img src="Readme Files\output_3.gif" width="1000" height="400">
+</div>
 ---
 
 ## 📦 Requirements
