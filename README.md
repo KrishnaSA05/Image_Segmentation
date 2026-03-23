@@ -80,8 +80,6 @@ Output (3, H, W)                ← 3-channel RGB segmentation mask
 - **Optimizer**: `Adam` (lr = 0.001)
 - **Epochs**: 50
 
-> ⚠️ The model outputs a **direct RGB image** — not class probabilities. Do NOT apply softmax or argmax on the output. Use the `rgb_channel()` thresholding pipeline instead (see Prediction section).
-
 <div align="Left">
     <img src="Readme Files/Unet.png" width="1000" height="400">
 </div>
@@ -178,7 +176,7 @@ Epoch [  2/50] train=0.5102  val=0.4873  (11.8s)
 ...
 ```
 
-The best model checkpoint is saved at `checkpoints/lanesegment.pth`.
+The best model checkpoint is saved at `checkpoints/lane_segment.pth`.
 
 ---
 
