@@ -5,6 +5,7 @@ A deep learning project that detects **drivable areas** and **adjacent lanes** i
 <div align="Left">
     <img src="Readme Files\Lane_detection_gif.gif" width="1000" height="400">
 </div>
+
 ---
 
 ## 📌 Project Overview
