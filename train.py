@@ -4,6 +4,11 @@ Training entry-point for Drivable Area Detection.
 Run:
     python train.py
     python train.py --config configs/config.yaml
+
+Phase 1 additions vs original:
+  - SegmentationMetrics (mIoU) computed every validation epoch
+  - Best checkpoint now saved on best val mIoU (not val loss)
+  - Per-class IoU logged at end of each epoch
 """
 import argparse
 import os
@@ -17,6 +22,7 @@ from src.data.dataset import build_dataloaders
 from src.models.unet import build_model
 from src.utils.helpers import load_config, get_device, save_checkpoint
 from src.utils.logger import get_logger
+from src.metrics.iou import SegmentationMetrics          # ← NEW
 
 logger = get_logger(__name__)
 
@@ -24,15 +30,6 @@ logger = get_logger(__name__)
 def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs):
     """
     Train the model for a single epoch.
-
-    Args:
-        model:        UNET model.
-        loader:       Training DataLoader.
-        optimizer:    Optimiser instance.
-        loss_fn:      Loss function.
-        device:       Compute device.
-        epoch:        Current epoch index (0-based).
-        total_epochs: Total number of epochs.
 
     Returns:
         Average training loss for the epoch.
@@ -52,8 +49,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epoc
 
         running_loss += loss.item()
 
-    avg_loss = running_loss / len(loader)
-    return avg_loss
+    return running_loss / len(loader)
 
 
 @torch.no_grad()
@@ -61,37 +57,32 @@ def validate(model, loader, loss_fn, device, epoch, total_epochs):
     """
     Evaluate the model on the validation set.
 
-    Args:
-        model:        UNET model.
-        loader:       Validation DataLoader.
-        loss_fn:      Loss function.
-        device:       Compute device.
-        epoch:        Current epoch index (0-based).
-        total_epochs: Total number of epochs.
-
     Returns:
-        Average validation loss for the epoch.
+        Tuple (avg_val_loss, metrics_dict) where metrics_dict contains
+        per-class IoU and mIoU computed over the full validation set.
     """
     model.eval()
     running_loss = 0.0
+    metrics      = SegmentationMetrics()                 # ← NEW
 
     for images, targets in tqdm(loader, desc=f"Epoch {epoch+1}/{total_epochs} [Val  ]"):
         images  = images.to(device)
         targets = targets.to(device)
+
         outputs = model(images)
         loss    = loss_fn(outputs, targets)
         running_loss += loss.item()
 
-    avg_loss = running_loss / len(loader)
-    return avg_loss
+        metrics.update(outputs, targets)                 # ← NEW
+
+    avg_loss     = running_loss / len(loader)
+    metric_results = metrics.compute()                   # ← NEW
+    return avg_loss, metric_results
 
 
 def train(config: dict) -> None:
     """
-    Full training loop with checkpointing and logging.
-
-    Args:
-        config: Configuration dictionary loaded from YAML.
+    Full training loop with checkpointing, loss logging, and mIoU tracking.
     """
     logger.info("=" * 60)
     logger.info("  Drivable Area Detection — Training Started")
@@ -111,34 +102,49 @@ def train(config: dict) -> None:
     optimizer = Adam(model.parameters(), lr=lr)
     loss_fn   = CrossEntropyLoss()
 
-    epochs     = config["training"]["epochs"]
-    best_val   = float("inf")
-    ckpt_path  = config["paths"]["model_checkpoint"]
+    epochs    = config["training"]["epochs"]
+    ckpt_path = config["paths"]["model_checkpoint"]
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+
+    # ── Track best on mIoU (not val loss) ────────────────────────────────────
+    best_miou = 0.0
 
     logger.info(f"Training {n_samples} samples | {epochs} epochs | lr={lr} | device={device}")
 
     for epoch in range(epochs):
         t0 = time.time()
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device, epoch, epochs)
-        val_loss   = validate(model, val_loader, loss_fn, device, epoch, epochs)
-        elapsed    = time.time() - t0
+        train_loss             = train_one_epoch(model, train_loader, optimizer, loss_fn, device, epoch, epochs)
+        val_loss, metric_results = validate(model, val_loader, loss_fn, device, epoch, epochs)
+        miou                   = metric_results["miou"]
+        elapsed                = time.time() - t0
 
+        # ── Epoch summary ─────────────────────────────────────────────────
         logger.info(
             f"Epoch [{epoch+1:3d}/{epochs}]  "
             f"train_loss={train_loss:.4f}  "
             f"val_loss={val_loss:.4f}  "
+            f"mIoU={miou*100:.2f}%  "
             f"time={elapsed:.1f}s"
         )
 
-        # Save best checkpoint
-        if config["training"]["save_best"] and val_loss < best_val:
-            best_val = val_loss
-            save_checkpoint(model, ckpt_path)
-            logger.info(f"  ↳ New best val_loss={best_val:.4f} — checkpoint saved")
+        # ── Per-class IoU ─────────────────────────────────────────────────
+        for name, iou in zip(metric_results["class_names"], metric_results["iou_per_class"]):
+            import math
+            if math.isnan(iou):
+                logger.info(f"  {name:<12} IoU: N/A")
+            else:
+                logger.info(f"  {name:<12} IoU: {iou*100:.2f}%")
 
-    logger.info("Training complete ✓")
+        # ── Checkpoint on best mIoU ───────────────────────────────────────
+        if config["training"]["save_best"] and miou > best_miou:
+            best_miou = miou
+            save_checkpoint(model, ckpt_path)
+            logger.info(f"  ↳ New best mIoU={best_miou*100:.2f}% — checkpoint saved")
+
+    logger.info("=" * 60)
+    logger.info(f"  Training complete ✓  |  Best mIoU: {best_miou*100:.2f}%")
+    logger.info("=" * 60)
 
 
 def main():
@@ -146,8 +152,7 @@ def main():
     parser.add_argument(
         "--config", default="configs/config.yaml", help="Path to YAML config file"
     )
-    args = parser.parse_args()
-
+    args   = parser.parse_args()
     config = load_config(args.config)
     train(config)
 
