@@ -1,12 +1,15 @@
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
 .env
 logs/
+app/logs/
 checkpoints/
 outputs/
 dataset/
 *.pth
+*.onnx
 *.zip
 .DS_Store

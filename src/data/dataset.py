@@ -4,11 +4,17 @@ Data loading and preprocessing pipeline for Drivable Area Detection.
 Phase 3 upgrade:
   - Replaced cv2 horizontal-flip-only augmentation with a full
     Albumentations pipeline (brightness, contrast, hue shift, CLAHE,
-    slight rotation, horizontal flip, coarse dropout)
-  - Augmentations are applied consistently to image AND label mask
-    (using Albumentations' built-in paired transform support)
+    slight rotation, horizontal flip)
+  - Augmentations applied consistently to image AND label mask via
+    Albumentations' built-in paired transform support
   - ToTensorV2 replaces torchvision ToTensor for Albumentations compatibility
   - Original API (build_dataloaders) is unchanged — drop-in replacement
+
+Fix (dataset.py v2):
+  - CoarseDropout moved to an image-only pipeline to prevent invalid
+    black pixels from being written into the label mask
+  - Train/val split now uses a shuffled index order (seeded for reproducibility)
+  - DataLoaders use persistent_workers=True to avoid per-epoch worker respawn
 
 Label scheme (3-class RGB):
     [0, 255, 0]  green  → class 0  Background
@@ -17,12 +23,12 @@ Label scheme (3-class RGB):
 """
 
 import pickle
+import random
 import numpy as np
 import cv2
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 
-# Albumentations — domain-specific augmentation library
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -35,35 +41,27 @@ logger = get_logger(__name__)
 
 def get_train_transforms(image_height: int, image_width: int) -> A.Compose:
     """
-    Albumentations pipeline applied only during training.
+    Albumentations pipeline applied to BOTH image and mask during training.
 
-    Choices are tuned for dashcam / road images:
-      - HorizontalFlip:           road scenes are symmetric left/right
-      - RandomBrightnessContrast: handles variable lighting conditions
-      - HueSaturationValue:       handles different road surface colours
-      - CLAHE:                    improves contrast in under/overexposed frames
-      - ShiftScaleRotate:         slight jitter; road scenes are near-horizontal
-        (limit=10° so lane markings stay recognisable)
-      - CoarseDropout:            occlusion simulation (other vehicles, etc.)
-
-    All transforms are applied to BOTH image and mask via
-    additional_targets={"mask": "image"}, keeping them in sync.
+    CoarseDropout is intentionally excluded here — it is applied separately
+    to the image only (see get_image_only_transforms) to avoid writing
+    invalid black pixels into the label mask.
 
     Args:
-        image_height: Target H after resize (80 from config.yaml).
-        image_width:  Target W after resize (160 from config.yaml).
+        image_height: Target H (80 from config.yaml).
+        image_width:  Target W (160 from config.yaml).
 
     Returns:
-        A.Compose pipeline.
+        A.Compose pipeline with additional_targets={"mask": "image"}.
     """
     return A.Compose(
         [
             # ── Geometry ────────────────────────────────────────────────────
             A.HorizontalFlip(p=0.5),
             A.ShiftScaleRotate(
-                shift_limit=0.03,    # max ±3% image translation
-                scale_limit=0.05,    # max ±5% scale change
-                rotate_limit=10,     # max ±10° rotation
+                shift_limit=0.03,
+                scale_limit=0.05,
+                rotate_limit=10,
                 border_mode=cv2.BORDER_REFLECT_101,
                 p=0.4,
             ),
@@ -82,11 +80,34 @@ def get_train_transforms(image_height: int, image_width: int) -> A.Compose:
             ),
             A.CLAHE(
                 clip_limit=2.0,
-                tile_grid_size=(4, 4),   # small grid for small 160×80 images
+                tile_grid_size=(4, 4),
                 p=0.3,
             ),
 
-            # ── Occlusion simulation ─────────────────────────────────────────
+            # ── Tensor conversion ────────────────────────────────────────────
+            ToTensorV2(),
+        ],
+        additional_targets={"mask": "image"},
+    )
+
+
+def get_image_only_transforms(image_height: int, image_width: int) -> A.Compose:
+    """
+    Augmentation applied ONLY to the image tensor (not the mask).
+
+    CoarseDropout simulates occlusion (other vehicles, sensor noise).
+    Keeping it image-only prevents black dropout holes from appearing in
+    the mask where they would be treated as an invalid class.
+
+    Args:
+        image_height: Used to compute max hole height.
+        image_width:  Used to compute max hole width.
+
+    Returns:
+        A.Compose pipeline.
+    """
+    return A.Compose(
+        [
             A.CoarseDropout(
                 max_holes=4,
                 max_height=image_height // 8,   # 10px at 80px height
@@ -94,13 +115,7 @@ def get_train_transforms(image_height: int, image_width: int) -> A.Compose:
                 fill_value=0,
                 p=0.2,
             ),
-
-            # ── Tensor conversion ────────────────────────────────────────────
-            # ToTensorV2 converts HWC uint8 → CHW float32, divides by 255
-            ToTensorV2(),
-        ],
-        # Apply the same spatial transforms to the mask
-        additional_targets={"mask": "image"},
+        ]
     )
 
 
@@ -176,21 +191,29 @@ class DrivableAreaDataset(Dataset):
     """
     PyTorch Dataset for drivable-area segmentation.
 
-    Uses Albumentations for augmentation, applying paired transforms
-    to both the image and its corresponding segmentation mask.
+    Uses Albumentations for paired image+mask augmentation, plus an optional
+    image-only transform (e.g. CoarseDropout) applied after the paired step.
 
     Args:
-        images:    List of (H x W x 3) uint8 numpy arrays (RGB).
-        labels:    List of (H x W x 3) uint8 numpy arrays (RGB mask).
-        transform: Albumentations A.Compose pipeline.
+        images:               List of (H x W x 3) uint8 numpy arrays (RGB).
+        labels:               List of (H x W x 3) uint8 numpy arrays (RGB mask).
+        transform:            Albumentations A.Compose pipeline (image + mask).
+        image_only_transform: Albumentations A.Compose applied to image only.
     """
 
-    def __init__(self, images: list, labels: list, transform: A.Compose = None):
+    def __init__(
+        self,
+        images: list,
+        labels: list,
+        transform: A.Compose = None,
+        image_only_transform: A.Compose = None,
+    ):
         if len(images) != len(labels):
             raise ValueError("images and labels must have equal length")
-        self.images    = images
-        self.labels    = labels
-        self.transform = transform
+        self.images               = images
+        self.labels               = labels
+        self.transform            = transform
+        self.image_only_transform = image_only_transform
         logger.debug(f"Dataset created with {len(self.images)} samples")
 
     def __len__(self) -> int:
@@ -201,14 +224,19 @@ class DrivableAreaDataset(Dataset):
         label = self.labels[idx]   # (H, W, 3) uint8
 
         if self.transform:
-            # Albumentations expects keyword args for additional targets
             transformed = self.transform(image=image, mask=label)
-            image = transformed["image"]   # now (3, H, W) float32 tensor
-            label = transformed["mask"]    # now (3, H, W) float32 tensor
+            image = transformed["image"]   # (3, H, W) float32 tensor
+            label = transformed["mask"]    # (3, H, W) float32 tensor
         else:
-            # Fallback: manual ToTensor if no transform provided
             image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
             label = torch.from_numpy(label.transpose(2, 0, 1)).float() / 255.0
+
+        # Image-only augmentation (CoarseDropout) — mask is NOT touched
+        if self.image_only_transform:
+            # Convert tensor → HWC uint8 numpy → apply → convert back
+            img_np = (image.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            img_np = self.image_only_transform(image=img_np)["image"]
+            image  = torch.from_numpy(img_np.transpose(2, 0, 1)).float() / 255.0
 
         return image, label
 
@@ -221,6 +249,9 @@ def build_dataloaders(config: dict):
 
     Train split gets the full Albumentations augmentation pipeline.
     Val split gets only tensor conversion (no augmentation).
+
+    The train/val split is shuffled with a fixed seed so results are
+    reproducible but not biased by dataset ordering.
 
     Args:
         config: Loaded config dictionary (configs/config.yaml).
@@ -243,15 +274,17 @@ def build_dataloaders(config: dict):
     # 2. Preprocess labels (black → green background)
     labels = replace_black_with_green(labels)
 
-    # 3. Train/val index split BEFORE building datasets
-    #    (so each split gets its own transform pipeline)
+    # 3. Shuffled train/val index split (seeded for reproducibility)
     n_total = len(images)
     n_train = int(n_total * config["data"]["train_split"])
     n_val   = n_total - n_train
 
-    indices    = list(range(n_total))
-    train_idx  = indices[:n_train]
-    val_idx    = indices[n_train:]
+    indices = list(range(n_total))
+    random.seed(42)
+    random.shuffle(indices)
+
+    train_idx = indices[:n_train]
+    val_idx   = indices[n_train:]
 
     train_images = [images[i] for i in train_idx]
     train_labels = [labels[i] for i in train_idx]
@@ -264,18 +297,31 @@ def build_dataloaders(config: dict):
     H = config["data"]["image_height"]   # 80
     W = config["data"]["image_width"]    # 160
 
-    if config["data"].get("augment", True):
-        train_transform = get_train_transforms(H, W)
+    augment = config["data"].get("augment", True)
+
+    if augment:
+        train_transform       = get_train_transforms(H, W)
+        image_only_transform  = get_image_only_transforms(H, W)
         logger.info("Albumentations augmentation pipeline active for training")
+        logger.info("CoarseDropout active on image only (mask excluded)")
     else:
-        train_transform = get_val_transforms()
+        train_transform      = get_val_transforms()
+        image_only_transform = None
         logger.info("Augmentation disabled — using val transforms for training too")
 
     val_transform = get_val_transforms()
 
     # 5. Datasets
-    train_ds = DrivableAreaDataset(train_images, train_labels, transform=train_transform)
-    val_ds   = DrivableAreaDataset(val_images,   val_labels,   transform=val_transform)
+    train_ds = DrivableAreaDataset(
+        train_images, train_labels,
+        transform=train_transform,
+        image_only_transform=image_only_transform,
+    )
+    val_ds = DrivableAreaDataset(
+        val_images, val_labels,
+        transform=val_transform,
+        image_only_transform=None,   # no augmentation on val
+    )
 
     # 6. DataLoaders
     batch = config["training"]["batch_size"]
@@ -283,9 +329,10 @@ def build_dataloaders(config: dict):
         train_ds,
         batch_size=batch,
         shuffle=True,
-        num_workers=2,         # 2 workers safe on both local and EC2 t2.micro
+        num_workers=2,
         pin_memory=True,
-        drop_last=True,        # avoids small last-batch shape issues
+        drop_last=True,
+        persistent_workers=True,
     )
     val_loader = DataLoader(
         val_ds,
@@ -293,6 +340,7 @@ def build_dataloaders(config: dict):
         shuffle=False,
         num_workers=2,
         pin_memory=True,
+        persistent_workers=True,
     )
 
     logger.info(

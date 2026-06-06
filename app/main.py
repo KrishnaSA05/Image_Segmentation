@@ -15,8 +15,8 @@ import numpy as np
 from PIL import Image
 
 from src.inference.predictor import DrivableAreaPredictor
-from src.explainability.gradcam import GradCAM, CLASS_NAMES   # ← NEW
-from src.models.unet import build_model                        # ← NEW
+from src.explainability.gradcam import GradCAM, CLASS_NAMES
+from src.models.unet import build_model
 from src.utils.helpers import load_config, load_checkpoint, get_device
 from src.utils.logger import get_logger
 
@@ -70,7 +70,14 @@ def load_gradcam(cfg_path: str, ckpt: str) -> GradCAM:
     model  = build_model(config)
     model  = load_checkpoint(model, ckpt, device)
     model.to(device)
-    return GradCAM(model, device=device)
+    # Pass image dimensions from config so GradCAM preprocessing
+    # always matches the model's expected input resolution.
+    return GradCAM(
+        model,
+        device=device,
+        image_height=config["data"]["image_height"],
+        image_width=config["data"]["image_width"],
+    )
 
 
 # ── File uploader ─────────────────────────────────────────────────────────────
@@ -96,13 +103,13 @@ if uploaded:
         try:
             with st.spinner("Running segmentation …"):
                 predictor = load_predictor(config_path, ckpt_path)
-                mask_np, overlay_bgr = predictor.predict(image_bgr)
+                mask_rgb, overlay_bgr = predictor.predict(image_bgr)
 
             overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
 
             with col2:
                 st.subheader("🎭 Predicted Mask")
-                st.image(mask_np, use_container_width=True)
+                st.image(mask_rgb, use_container_width=True)
 
             with col3:
                 st.subheader("🖼️ Overlay")
@@ -131,7 +138,7 @@ if uploaded:
             options=list(range(len(CLASS_NAMES))),
             format_func=lambda i: f"{CLASS_NAMES[i]}",
             horizontal=True,
-            index=1,   # default: Drivable
+            index=0,   # default: Drivable (class 0)
         )
 
         try:
@@ -159,7 +166,6 @@ if uploaded:
                 st.image(overlay_gc, use_container_width=True)
                 st.caption("Heatmap blended with original image")
 
-            # Interpretation hint
             st.info(
                 f"**How to read this:** Bright red/yellow regions show where the model "
                 f"concentrated attention when predicting **{CLASS_NAMES[target_class]}** pixels. "

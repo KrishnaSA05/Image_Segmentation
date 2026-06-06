@@ -2,13 +2,13 @@
 Generate Grad-CAM visualisations for the trained U-Net.
 
 Examples:
-    # Drivable area heatmap on a single image
+    # Drivable area heatmap on a single image (default class 0 = Drivable)
     python gradcam_visualize.py --input road.jpg --output outputs/
 
     # All 3 classes
     python gradcam_visualize.py --input road.jpg --output outputs/ --all-classes
 
-    # Specific class (0=Background, 1=Drivable, 2=Adjacent)
+    # Specific class (0=Drivable, 1=Background, 2=Adjacent)
     python gradcam_visualize.py --input road.jpg --output outputs/ --class-idx 2
 """
 import argparse
@@ -50,7 +50,7 @@ def main():
     parser.add_argument("--input",       required=True,          help="Path to input image (JPG/PNG)")
     parser.add_argument("--output",      default="outputs/",     help="Directory to save results")
     parser.add_argument("--config",      default="configs/config.yaml")
-    parser.add_argument("--class-idx",   type=int, default=1,    help="Class to visualise: 0=BG, 1=Drivable, 2=Adjacent")
+    parser.add_argument("--class-idx",   type=int, default=0,    help="Class to visualise: 0=Drivable, 1=BG, 2=Adjacent")
     parser.add_argument("--all-classes", action="store_true",    help="Generate CAMs for all 3 classes")
     parser.add_argument("--alpha",       type=float, default=0.5, help="Heatmap blend strength (0-1)")
     args = parser.parse_args()
@@ -74,7 +74,14 @@ def main():
     logger.info(f"Input image: {args.input}  shape={image_bgr.shape}")
 
     # ── Generate Grad-CAM ─────────────────────────────────────────────────────
-    gradcam = GradCAM(model, device=device)
+    # Pass image dimensions from config so GradCAM preprocessing matches
+    # the model's expected input resolution exactly.
+    gradcam = GradCAM(
+        model,
+        device=device,
+        image_height=config["data"]["image_height"],
+        image_width=config["data"]["image_width"],
+    )
 
     if args.all_classes:
         logger.info("Generating Grad-CAM for all 3 classes …")

@@ -3,14 +3,25 @@ Inference pipeline — loads a trained U-Net checkpoint and
 runs prediction on single images or video frames.
 """
 import cv2
-import torch
 import numpy as np
+import torch
 from torchvision.transforms import transforms
+
 from src.models.unet import UNET, build_model
 from src.utils.helpers import load_checkpoint, get_device, overlay_mask
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Class-colour map — matches channel-argmax ordering in iou.py:
+#   class 0 → Drivable    → Red   [255, 0,   0  ]
+#   class 1 → Background  → Green [0,   255, 0  ]
+#   class 2 → Adjacent    → Blue  [0,   0,   255]
+_CLASS_COLORS = np.array([
+    [255,   0,   0],   # 0: Drivable   — Red
+    [  0, 255,   0],   # 1: Background — Green
+    [  0,   0, 255],   # 2: Adjacent   — Blue
+], dtype=np.uint8)
 
 
 class DrivableAreaPredictor:
@@ -19,16 +30,16 @@ class DrivableAreaPredictor:
 
     Usage:
         predictor = DrivableAreaPredictor(config)
-        mask, overlay = predictor.predict(image_bgr)
+        mask_rgb, overlay_bgr = predictor.predict(image_bgr)
 
     Args:
         config: Loaded config dictionary.
     """
 
     def __init__(self, config: dict):
-        self.config = config
-        self.device = get_device(config["inference"]["device"])
-        self.model  = self._load_model()
+        self.config    = config
+        self.device    = get_device(config["inference"]["device"])
+        self.model     = self._load_model()
         self.transform = transforms.Compose([transforms.ToTensor()])
         logger.info("DrivableAreaPredictor ready ✓")
 
@@ -64,40 +75,43 @@ class DrivableAreaPredictor:
     @torch.no_grad()
     def predict(self, image_bgr: np.ndarray):
         """
-        Run a full forward pass and return the prediction mask + blended overlay.
+        Run a full forward pass and return a class-coloured mask + overlay.
+
+        The mask is produced by taking argmax over the 3 output channels
+        (each channel corresponds to a class), then mapping each pixel to
+        its class RGB colour:
+            class 0 → Drivable   → Red
+            class 1 → Background → Green
+            class 2 → Adjacent   → Blue
 
         Args:
             image_bgr: Raw BGR image (any resolution).
 
         Returns:
             Tuple:
-              - mask_np  (np.ndarray): Predicted mask (H, W, 3) uint8.
-              - overlay  (np.ndarray): Original image + translucent mask (H, W, 3) uint8.
+              - mask_rgb  (np.ndarray): Class-coloured mask (H, W, 3) uint8 RGB.
+              - overlay   (np.ndarray): Original image + translucent mask (H, W, 3) uint8 BGR.
         """
         logger.debug("Running inference …")
 
-        # Preprocess
         tensor = self.preprocess(image_bgr)
 
-        # Forward pass
-        output = self.model(tensor)                          # (1, 3, H, W)
-        pred   = output.squeeze(0).cpu().permute(1, 2, 0)   # (H, W, 3)
-        pred   = pred.numpy()
+        output    = self.model(tensor)                     # (1, 3, H, W)
+        pred_idx  = output.squeeze(0).argmax(dim=0)        # (H, W) — class per pixel
+        pred_np   = pred_idx.cpu().numpy().astype(np.uint8)
 
-        # Normalise to [0, 255]
-        pred_norm = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)
-        mask_np   = (pred_norm * 255).astype(np.uint8)
+        # Map class indices to RGB colours via the lookup table
+        mask_rgb  = _CLASS_COLORS[pred_np]                 # (H, W, 3) uint8 RGB
 
         # Resize mask back to original image dimensions for overlay
         h_orig, w_orig = image_bgr.shape[:2]
-        mask_resized   = cv2.resize(mask_np, (w_orig, h_orig))
+        mask_resized   = cv2.resize(mask_rgb, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
         mask_bgr       = cv2.cvtColor(mask_resized, cv2.COLOR_RGB2BGR)
 
-        # Blend with original
         blended = overlay_mask(image_bgr.copy(), mask_bgr)
 
         logger.debug("Inference complete ✓")
-        return mask_np, blended
+        return mask_rgb, blended
 
 
 def predict_video(predictor: DrivableAreaPredictor, input_path: str, output_path: str) -> None:

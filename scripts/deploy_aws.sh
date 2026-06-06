@@ -15,9 +15,10 @@
 #    Step 1  — Create ECR repository (idempotent — safe to re-run)
 #    Step 2  — Build Docker image locally
 #    Step 3  — Push image to ECR
-#    Step 4  — Launch EC2 t2.micro with a user-data bootstrap that pulls
-#               the image from ECR and starts the Streamlit container
-#    Step 5  — Print the public URL
+#    Step 4  — Resolve the latest Amazon Linux 2 AMI for the target region
+#              (fixes hardcoded us-east-1 AMI that fails in other regions)
+#    Step 5  — Launch EC2 t2.micro with user-data bootstrap
+#    Step 6  — Print the public URL
 # =============================================================================
 
 set -euo pipefail
@@ -41,7 +42,7 @@ echo "  ECR URI : ${ECR_URI}"
 echo ""
 
 # ── Step 1: Create ECR repository (idempotent) ────────────────────────────────
-echo "▶ Step 1/5  Creating ECR repository (if not exists) …"
+echo "▶ Step 1/6  Creating ECR repository (if not exists) …"
 aws ecr describe-repositories \
     --repository-names "${ECR_REPO_NAME}" \
     --region "${AWS_REGION}" \
@@ -55,13 +56,13 @@ echo "  ✓ ECR repository ready"
 
 # ── Step 2: Build Docker image ────────────────────────────────────────────────
 echo ""
-echo "▶ Step 2/5  Building Docker image …"
+echo "▶ Step 2/6  Building Docker image …"
 docker build -t "${ECR_REPO_NAME}:${IMAGE_TAG}" .
 echo "  ✓ Image built"
 
 # ── Step 3: Push to ECR ───────────────────────────────────────────────────────
 echo ""
-echo "▶ Step 3/5  Pushing image to ECR …"
+echo "▶ Step 3/6  Pushing image to ECR …"
 aws ecr get-login-password --region "${AWS_REGION}" \
     | docker login --username AWS --password-stdin \
       "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -70,12 +71,31 @@ docker tag "${ECR_REPO_NAME}:${IMAGE_TAG}" "${ECR_URI}:${IMAGE_TAG}"
 docker push "${ECR_URI}:${IMAGE_TAG}"
 echo "  ✓ Image pushed → ${ECR_URI}:${IMAGE_TAG}"
 
-# ── Step 4: Launch EC2 t2.micro ───────────────────────────────────────────────
+# ── Step 4: Resolve latest Amazon Linux 2 AMI for target region ──────────────
+# AMI IDs are region-specific — a hardcoded us-east-1 AMI will fail in
+# eu-central-1 or any other region. This query always gets the latest
+# Amazon Linux 2 AMI available in the configured AWS_REGION.
 echo ""
-echo "▶ Step 4/5  Launching EC2 instance …"
+echo "▶ Step 4/6  Resolving latest Amazon Linux 2 AMI for ${AWS_REGION} …"
+AMI_ID=$(aws ec2 describe-images \
+    --owners amazon \
+    --filters \
+        "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" \
+        "Name=state,Values=available" \
+    --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+    --output text \
+    --region "${AWS_REGION}")
 
-# User-data script runs on first boot inside the EC2 instance.
-# It installs Docker, authenticates to ECR, pulls the image, and starts the app.
+if [[ -z "${AMI_ID}" || "${AMI_ID}" == "None" ]]; then
+    echo "  ERROR: Could not resolve Amazon Linux 2 AMI in ${AWS_REGION}" >&2
+    exit 1
+fi
+echo "  ✓ AMI resolved: ${AMI_ID}"
+
+# ── Step 5: Launch EC2 t2.micro ───────────────────────────────────────────────
+echo ""
+echo "▶ Step 5/6  Launching EC2 instance …"
+
 USER_DATA=$(cat <<USERDATA
 #!/bin/bash
 yum update -y
@@ -83,7 +103,7 @@ amazon-linux-extras install docker -y
 service docker start
 usermod -a -G docker ec2-user
 
-# Authenticate to ECR from inside the instance using the attached IAM role
+# Authenticate to ECR using the attached IAM role
 aws ecr get-login-password --region ${AWS_REGION} \
     | docker login --username AWS --password-stdin \
       ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
@@ -98,10 +118,8 @@ docker run -d \
 USERDATA
 )
 
-# Launch instance — Amazon Linux 2 AMI (us-east-1 default; update AMI for other regions)
-# t2.micro is free-tier eligible
 INSTANCE_ID=$(aws ec2 run-instances \
-    --image-id ami-0c101f26f147fa7fd \
+    --image-id "${AMI_ID}" \
     --instance-type t2.micro \
     --key-name "${EC2_KEY_NAME}" \
     --user-data "${USER_DATA}" \
@@ -130,9 +148,9 @@ aws ec2 authorize-security-group-ingress \
     --region "${AWS_REGION}" \
     > /dev/null 2>&1 || true   # ignore if rule already exists
 
-# ── Step 5: Wait and print URL ────────────────────────────────────────────────
+# ── Step 6: Wait and print URL ────────────────────────────────────────────────
 echo ""
-echo "▶ Step 5/5  Waiting for instance to get a public IP …"
+echo "▶ Step 6/6  Waiting for instance to get a public IP …"
 sleep 15
 
 PUBLIC_IP=$(aws ec2 describe-instances \
@@ -146,6 +164,7 @@ echo "╔═══════════════════════�
 echo "║   Deployment complete ✓                          ║"
 echo "╠══════════════════════════════════════════════════╣"
 echo "║   Instance ID : ${INSTANCE_ID}"
+echo "║   AMI used    : ${AMI_ID}"
 echo "║   Public IP   : ${PUBLIC_IP}"
 echo "║"
 echo "║   App URL (ready in ~2 min after boot):"
