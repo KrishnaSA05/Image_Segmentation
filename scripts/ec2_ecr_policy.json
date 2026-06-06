@@ -1,0 +1,41 @@
+{
+  "Description": "IAM policy that allows an EC2 instance to pull images from ECR. Attach this to the EC2 instance role (EC2ECRReadRole) so the deploy script works without hardcoded credentials on the server.",
+
+  "PolicyName": "EC2ECRReadAccess",
+
+  "PolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "AllowECRRead",
+        "Effect": "Allow",
+        "Action": [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetAuthorizationToken"
+        ],
+        "Resource": "*"
+      }
+    ]
+  },
+
+  "SetupInstructions": {
+    "Step1_CreateRole": {
+      "command": "aws iam create-role --role-name EC2ECRReadRole --assume-role-policy-document file://scripts/ec2_trust_policy.json",
+      "note": "Creates the IAM role EC2 will assume"
+    },
+    "Step2_AttachPolicy": {
+      "command": "aws iam put-role-policy --role-name EC2ECRReadRole --policy-name EC2ECRReadAccess --policy-document file://scripts/ec2_ecr_policy.json",
+      "note": "Attaches ECR read permissions to the role"
+    },
+    "Step3_CreateInstanceProfile": {
+      "command": "aws iam create-instance-profile --instance-profile-name EC2ECRReadRole && aws iam add-role-to-instance-profile --instance-profile-name EC2ECRReadRole --role-name EC2ECRReadRole",
+      "note": "Wraps the role in an instance profile so EC2 can use it"
+    },
+    "Step4_Verify": {
+      "command": "aws iam get-instance-profile --instance-profile-name EC2ECRReadRole",
+      "note": "Confirms the profile exists before running deploy_aws.sh"
+    }
+  }
+}
