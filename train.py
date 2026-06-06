@@ -5,13 +5,18 @@ Run:
     python train.py
     python train.py --config configs/config.yaml
 
-Phase 1 additions vs original:
-  - SegmentationMetrics (mIoU) computed every validation epoch
-  - Best checkpoint now saved on best val mIoU (not val loss)
-  - Per-class IoU logged at end of each epoch
+Phase 3 fix — class imbalance:
+  - Labels converted from RGB float tensors to integer class indices before
+    loss computation (the standard CrossEntropyLoss usage)
+  - Weighted CrossEntropyLoss with inverse-frequency weights so the model
+    is penalised more for missing minority classes (Drivable, Adjacent).
 
-Phase 2 additions:
-  - ReduceLROnPlateau scheduler (tracks mIoU, halves lr on plateau)
+  Observed pixel frequencies:
+      Background  ~83%  -> weight 1.0  (majority, low penalty)
+      Drivable    ~12%  -> weight 4.0
+      Adjacent    ~ 5%  -> weight 8.0
+
+  Weight order matches CLASS_NAMES in iou.py: [Drivable, Background, Adjacent]
 """
 import argparse
 import math
@@ -28,7 +33,7 @@ from src.data.dataset import build_dataloaders
 from src.models.unet import build_model
 from src.utils.helpers import load_config, get_device, save_checkpoint
 from src.utils.logger import get_logger
-from src.metrics.iou import SegmentationMetrics
+from src.metrics.iou import SegmentationMetrics, rgb_label_to_class_index
 
 logger = get_logger(__name__)
 
@@ -36,6 +41,9 @@ logger = get_logger(__name__)
 def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs):
     """
     Train the model for a single epoch.
+
+    Targets are converted from RGB float tensors (B, 3, H, W) to integer
+    class-index maps (B, H, W) so CrossEntropyLoss can apply class weights.
 
     Returns:
         Average training loss for the epoch.
@@ -47,9 +55,12 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epoc
         images  = images.to(device)
         targets = targets.to(device)
 
+        # Convert RGB float labels -> integer class indices (B, H, W)
+        targets_cls = rgb_label_to_class_index(targets)
+
         optimizer.zero_grad()
-        outputs = model(images)
-        loss    = loss_fn(outputs, targets)
+        outputs = model(images)                  # (B, 3, H, W) logits
+        loss    = loss_fn(outputs, targets_cls)  # weighted CE on integer targets
         loss.backward()
         optimizer.step()
 
@@ -64,8 +75,7 @@ def validate(model, loader, loss_fn, device, epoch, total_epochs):
     Evaluate the model on the validation set.
 
     Returns:
-        Tuple (avg_val_loss, metrics_dict) where metrics_dict contains
-        per-class IoU and mIoU computed over the full validation set.
+        Tuple (avg_val_loss, metrics_dict)
     """
     model.eval()
     running_loss = 0.0
@@ -75,10 +85,13 @@ def validate(model, loader, loss_fn, device, epoch, total_epochs):
         images  = images.to(device)
         targets = targets.to(device)
 
+        targets_cls = rgb_label_to_class_index(targets)
+
         outputs = model(images)
-        loss    = loss_fn(outputs, targets)
+        loss    = loss_fn(outputs, targets_cls)
         running_loss += loss.item()
 
+        # SegmentationMetrics.update() accepts the original float RGB labels
         metrics.update(outputs, targets)
 
     avg_loss       = running_loss / len(loader)
@@ -88,11 +101,10 @@ def validate(model, loader, loss_fn, device, epoch, total_epochs):
 
 def train(config: dict) -> None:
     """
-    Full training loop with checkpointing, loss logging, mIoU tracking,
-    and ReduceLROnPlateau scheduling.
+    Full training loop with weighted CrossEntropyLoss and ReduceLROnPlateau.
     """
     logger.info("=" * 60)
-    logger.info("  Drivable Area Detection — Training Started")
+    logger.info("  Drivable Area Detection - Training Started")
     logger.info("=" * 60)
 
     device = get_device(config["inference"]["device"])
@@ -104,19 +116,29 @@ def train(config: dict) -> None:
     model = build_model(config)
     model.to(device)
 
-    # Optimiser & loss
+    # Optimiser
     lr        = config["training"]["learning_rate"]
     optimizer = Adam(model.parameters(), lr=lr)
-    loss_fn   = CrossEntropyLoss()
 
-    # LR scheduler — halves lr if mIoU doesn't improve for 3 epochs
+    # Weighted CrossEntropyLoss
+    # Weight order: [Drivable(0), Background(1), Adjacent(2)]
+    # Background fills ~83% of pixels; without weights the model collapses
+    # to predicting background everywhere giving 0% on Drivable and Adjacent.
+    class_weights = torch.tensor([4.0, 1.0, 8.0], device=device)
+    loss_fn       = CrossEntropyLoss(weight=class_weights)
+
+    logger.info(
+        "Loss: weighted CrossEntropyLoss  "
+        "weights=[Drivable=4.0, Background=1.0, Adjacent=8.0]"
+    )
+
+    # LR scheduler - halves lr if mIoU doesn't improve for 3 epochs
     scheduler = ReduceLROnPlateau(
         optimizer,
-        mode="max",       # maximise mIoU
+        mode="max",
         factor=0.5,
         patience=3,
         min_lr=1e-6,
-        verbose=True,
     )
 
     epochs    = config["training"]["epochs"]
@@ -124,6 +146,7 @@ def train(config: dict) -> None:
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
     best_miou = 0.0
+    prev_lr   = lr
 
     logger.info(f"Training {n_samples} samples | {epochs} epochs | lr={lr} | device={device}")
 
@@ -135,11 +158,13 @@ def train(config: dict) -> None:
         miou                     = metric_results["miou"]
         elapsed                  = time.time() - t0
 
-        # Step scheduler on mIoU
         scheduler.step(miou)
         current_lr = optimizer.param_groups[0]["lr"]
 
-        # Epoch summary
+        if current_lr < prev_lr:
+            logger.info(f"  LR reduced: {prev_lr:.6f} -> {current_lr:.6f}")
+            prev_lr = current_lr
+
         logger.info(
             f"Epoch [{epoch+1:3d}/{epochs}]  "
             f"train_loss={train_loss:.4f}  "
@@ -149,21 +174,19 @@ def train(config: dict) -> None:
             f"time={elapsed:.1f}s"
         )
 
-        # Per-class IoU
         for name, iou in zip(metric_results["class_names"], metric_results["iou_per_class"]):
             if math.isnan(iou):
                 logger.info(f"  {name:<12} IoU: N/A")
             else:
                 logger.info(f"  {name:<12} IoU: {iou*100:.2f}%")
 
-        # Checkpoint on best mIoU
         if config["training"]["save_best"] and miou > best_miou:
             best_miou = miou
             save_checkpoint(model, ckpt_path)
-            logger.info(f"  ↳ New best mIoU={best_miou*100:.2f}% — checkpoint saved")
+            logger.info(f"  New best mIoU={best_miou*100:.2f}% -- checkpoint saved")
 
     logger.info("=" * 60)
-    logger.info(f"  Training complete ✓  |  Best mIoU: {best_miou*100:.2f}%")
+    logger.info(f"  Training complete  |  Best mIoU: {best_miou*100:.2f}%")
     logger.info("=" * 60)
 
 

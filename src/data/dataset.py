@@ -13,13 +13,15 @@ Phase 3 upgrade:
 Fix (dataset.py v2):
   - CoarseDropout moved to an image-only pipeline to prevent invalid
     black pixels from being written into the label mask
+  - CoarseDropout uses new Albumentations API (num_holes_range, hole_height_range,
+    hole_width_range) compatible with albumentations >= 1.4
   - Train/val split now uses a shuffled index order (seeded for reproducibility)
   - DataLoaders use persistent_workers=True to avoid per-epoch worker respawn
 
 Label scheme (3-class RGB):
-    [0, 255, 0]  green  → class 0  Background
-    [255, 0, 0]  red    → class 1  Drivable
-    [0, 0, 255]  blue   → class 2  Adjacent
+    [255, 0, 0]  red    -> class 0  Drivable
+    [0, 255, 0]  green  -> class 1  Background
+    [0, 0, 255]  blue   -> class 2  Adjacent
 """
 
 import pickle
@@ -56,7 +58,7 @@ def get_train_transforms(image_height: int, image_width: int) -> A.Compose:
     """
     return A.Compose(
         [
-            # ── Geometry ────────────────────────────────────────────────────
+            # -- Geometry ----------------------------------------------------
             A.HorizontalFlip(p=0.5),
             A.ShiftScaleRotate(
                 shift_limit=0.03,
@@ -66,7 +68,7 @@ def get_train_transforms(image_height: int, image_width: int) -> A.Compose:
                 p=0.4,
             ),
 
-            # ── Photometric ─────────────────────────────────────────────────
+            # -- Photometric -------------------------------------------------
             A.RandomBrightnessContrast(
                 brightness_limit=0.2,
                 contrast_limit=0.2,
@@ -84,7 +86,7 @@ def get_train_transforms(image_height: int, image_width: int) -> A.Compose:
                 p=0.3,
             ),
 
-            # ── Tensor conversion ────────────────────────────────────────────
+            # -- Tensor conversion -------------------------------------------
             ToTensorV2(),
         ],
         additional_targets={"mask": "image"},
@@ -96,23 +98,26 @@ def get_image_only_transforms(image_height: int, image_width: int) -> A.Compose:
     Augmentation applied ONLY to the image tensor (not the mask).
 
     CoarseDropout simulates occlusion (other vehicles, sensor noise).
-    Keeping it image-only prevents black dropout holes from appearing in
-    the mask where they would be treated as an invalid class.
+    Uses the new Albumentations >= 1.4 API (num_holes_range, hole_height_range,
+    hole_width_range) instead of the deprecated max_holes / max_height / max_width.
 
     Args:
-        image_height: Used to compute max hole height.
-        image_width:  Used to compute max hole width.
+        image_height: Used to compute hole height range.
+        image_width:  Used to compute hole width range.
 
     Returns:
         A.Compose pipeline.
     """
+    hole_h = image_height // 8   # 10px at 80px height
+    hole_w = image_width  // 8   # 20px at 160px width
+
     return A.Compose(
         [
             A.CoarseDropout(
-                max_holes=4,
-                max_height=image_height // 8,   # 10px at 80px height
-                max_width=image_width  // 8,    # 20px at 160px width
-                fill_value=0,
+                num_holes_range=(1, 4),
+                hole_height_range=(hole_h // 2, hole_h),
+                hole_width_range=(hole_w // 2, hole_w),
+                fill=0,
                 p=0.2,
             ),
         ]
@@ -165,9 +170,9 @@ def replace_black_with_green(labels: list) -> list:
     Replace every pure-black pixel (background) with green [0, 255, 0].
 
     Converts the label space to 3-class:
-        Green  → background
-        Red    → drivable area
-        Blue   → adjacent lane
+        Green  -> background
+        Red    -> drivable area
+        Blue   -> adjacent lane
 
     Args:
         labels: List of (H x W x 3) uint8 label arrays.
@@ -175,7 +180,7 @@ def replace_black_with_green(labels: list) -> list:
     Returns:
         Modified list of label arrays.
     """
-    logger.info("Applying background mask replacement (black → green) …")
+    logger.info("Applying background mask replacement (black -> green) ...")
     augmented = []
     for label in labels:
         mask = np.all(label == [0, 0, 0], axis=2)
@@ -225,15 +230,21 @@ class DrivableAreaDataset(Dataset):
 
         if self.transform:
             transformed = self.transform(image=image, mask=label)
-            image = transformed["image"]   # (3, H, W) float32 tensor
-            label = transformed["mask"]    # (3, H, W) float32 tensor
+            image = transformed["image"]
+            label = transformed["mask"]
+            # ToTensorV2 keeps the original uint8 dtype — explicitly cast to
+            # float32 and normalise to [0, 1] so the model receives FloatTensors.
+            if image.dtype == torch.uint8:
+                image = image.float() / 255.0
+            if label.dtype == torch.uint8:
+                label = label.float() / 255.0
         else:
             image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
             label = torch.from_numpy(label.transpose(2, 0, 1)).float() / 255.0
 
-        # Image-only augmentation (CoarseDropout) — mask is NOT touched
+        # Image-only augmentation (CoarseDropout) -- mask is NOT touched
         if self.image_only_transform:
-            # Convert tensor → HWC uint8 numpy → apply → convert back
+            # Convert tensor -> HWC uint8 numpy -> apply -> convert back
             img_np = (image.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             img_np = self.image_only_transform(image=img_np)["image"]
             image  = torch.from_numpy(img_np.transpose(2, 0, 1)).float() / 255.0
@@ -245,7 +256,7 @@ class DrivableAreaDataset(Dataset):
 
 def build_dataloaders(config: dict):
     """
-    Full pipeline: load pickles → preprocess → split → wrap in DataLoaders.
+    Full pipeline: load pickles -> preprocess -> split -> wrap in DataLoaders.
 
     Train split gets the full Albumentations augmentation pipeline.
     Val split gets only tensor conversion (no augmentation).
@@ -271,7 +282,7 @@ def build_dataloaders(config: dict):
         f"dtype: {images[0].dtype}"
     )
 
-    # 2. Preprocess labels (black → green background)
+    # 2. Preprocess labels (black -> green background)
     labels = replace_black_with_green(labels)
 
     # 3. Shuffled train/val index split (seeded for reproducibility)
@@ -300,8 +311,8 @@ def build_dataloaders(config: dict):
     augment = config["data"].get("augment", True)
 
     if augment:
-        train_transform       = get_train_transforms(H, W)
-        image_only_transform  = get_image_only_transforms(H, W)
+        train_transform      = get_train_transforms(H, W)
+        image_only_transform = get_image_only_transforms(H, W)
         logger.info("Albumentations augmentation pipeline active for training")
         logger.info("CoarseDropout active on image only (mask excluded)")
     else:
@@ -320,7 +331,7 @@ def build_dataloaders(config: dict):
     val_ds = DrivableAreaDataset(
         val_images, val_labels,
         transform=val_transform,
-        image_only_transform=None,   # no augmentation on val
+        image_only_transform=None,
     )
 
     # 6. DataLoaders
@@ -344,7 +355,7 @@ def build_dataloaders(config: dict):
     )
 
     logger.info(
-        f"DataLoaders ready ✓  |  "
+        f"DataLoaders ready |  "
         f"train batches: {len(train_loader)}  |  "
         f"val batches: {len(val_loader)}"
     )
