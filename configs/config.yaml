@@ -48,13 +48,13 @@ model:
   features:     [64, 128, 256, 512]
 
 training:
-  epochs:        20
-  batch_size:    16
+  epochs: 60          # was 20 — needs more time, especially for Adjacent
+  batch_size: 16
   learning_rate: 0.001
-  optimizer:     "adam"
-  loss:          "cross_entropy"
-  save_best:     true
-  log_interval:  1             # log every N epochs
+  optimizer: "adam"
+  loss: "cross_entropy"
+  save_best: true
+  log_interval: 1            # log every N epochs
 
 inference:
   device: "auto"               # "auto", "cpu", or "cuda"
