@@ -124,7 +124,7 @@ def train(config: dict) -> None:
     # Weight order: [Drivable(0), Background(1), Adjacent(2)]
     # Background fills ~83% of pixels; without weights the model collapses
     # to predicting background everywhere giving 0% on Drivable and Adjacent.
-    class_weights = torch.tensor([4.0, 1.0, 8.0], device=device)
+    class_weights = torch.tensor([4.0, 1.0, 12.0], device=device)
     loss_fn       = CrossEntropyLoss(weight=class_weights)
 
     logger.info(
@@ -137,7 +137,7 @@ def train(config: dict) -> None:
         optimizer,
         mode="max",
         factor=0.5,
-        patience=3,
+        patience=5,
         min_lr=1e-6,
     )
 
