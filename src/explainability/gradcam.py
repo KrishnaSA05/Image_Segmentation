@@ -144,7 +144,7 @@ class GradCAM:
         activations = self._activations[0]           # (C, h, w)
 
         weights = gradients.mean(dim=(1, 2))         # (C,) global avg pool
-        cam     = torch.zeros(activations.shape[1:], dtype=torch.float32)
+        cam = torch.zeros(activations.shape[1:], dtype=torch.float32, device=self.device)
 
         for i, w in enumerate(weights):
             cam += w * activations[i]
