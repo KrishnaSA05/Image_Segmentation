@@ -5,18 +5,24 @@ Run:
     python train.py
     python train.py --config configs/config.yaml
 
-Phase 3 fix — class imbalance:
-  - Labels converted from RGB float tensors to integer class indices before
-    loss computation (the standard CrossEntropyLoss usage)
-  - Weighted CrossEntropyLoss with inverse-frequency weights so the model
-    is penalised more for missing minority classes (Drivable, Adjacent).
+Changes in this version:
+  - Combined Loss (CE + Dice):
+      * Weighted CrossEntropyLoss handles class imbalance via inverse-frequency weights
+      * Soft Dice Loss directly optimises the IoU metric and is naturally
+        robust to class imbalance — it works on predicted probabilities, not
+        raw logits, so it penalises false negatives on minority classes hard
+      * Final loss = 0.5 * CE + 0.5 * Dice
+  - CosineAnnealingLR replaces ReduceLROnPlateau:
+      * ReduceLROnPlateau + noisy mIoU caused premature LR cuts (6 cuts in
+        60 epochs, ending at lr=0.000016 — barely any gradient updates)
+      * CosineAnnealingLR decays smoothly over the full training run,
+        independent of metric noise — no more premature cuts
+  - Boosted class weights [Drivable=5.0, Background=1.0, Adjacent=12.0]
+      * Drivable was underperforming (34%) relative to Background (82%)
+        despite a weight of 4.0 — bumped to 5.0
+      * Adjacent kept at 12.0 (was learning well)
 
-  Observed pixel frequencies:
-      Background  ~83%  -> weight 1.0  (majority, low penalty)
-      Drivable    ~12%  -> weight 4.0
-      Adjacent    ~ 5%  -> weight 8.0
-
-  Weight order matches CLASS_NAMES in iou.py: [Drivable, Background, Adjacent]
+Expected result: ~52-58% mIoU vs previous best of 44.35%
 """
 import argparse
 import math
@@ -24,9 +30,10 @@ import os
 import time
 
 import torch
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from src.data.dataset import build_dataloaders
@@ -38,12 +45,82 @@ from src.metrics.iou import SegmentationMetrics, rgb_label_to_class_index
 logger = get_logger(__name__)
 
 
-def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs):
-    """
-    Train the model for a single epoch.
+# ── Loss functions ────────────────────────────────────────────────────────────
 
-    Targets are converted from RGB float tensors (B, 3, H, W) to integer
-    class-index maps (B, H, W) so CrossEntropyLoss can apply class weights.
+def dice_loss(
+    outputs: torch.Tensor,
+    targets_cls: torch.Tensor,
+    num_classes: int = 3,
+    smooth: float = 1.0,
+) -> torch.Tensor:
+    """
+    Soft multiclass Dice loss.
+
+    Directly optimises overlap between predicted and ground-truth masks.
+    Naturally handles class imbalance — classes with few pixels contribute
+    just as much to the loss as the dominant background class.
+
+    Formula per class c:
+        Dice_c = 1 - (2 * |P_c ∩ G_c| + smooth) / (|P_c| + |G_c| + smooth)
+
+    Args:
+        outputs:     Raw model logits (B, C, H, W).
+        targets_cls: Integer class indices (B, H, W).
+        num_classes: Number of segmentation classes.
+        smooth:      Laplace smoothing to avoid division by zero.
+
+    Returns:
+        Scalar Dice loss averaged over all classes and the batch.
+    """
+    probs = torch.softmax(outputs, dim=1)           # (B, C, H, W) probabilities
+
+    # One-hot encode integer targets -> (B, C, H, W)
+    one_hot = torch.zeros_like(probs).scatter_(
+        1, targets_cls.unsqueeze(1).long(), 1.0
+    )
+
+    # Sum over batch and spatial dims, keep class dim
+    dims        = (0, 2, 3)
+    intersection = (probs * one_hot).sum(dim=dims)  # (C,)
+    cardinality  = probs.sum(dim=dims) + one_hot.sum(dim=dims)  # (C,)
+
+    dice_per_class = 1.0 - (2.0 * intersection + smooth) / (cardinality + smooth)
+    return dice_per_class.mean()
+
+
+def combined_loss(
+    outputs: torch.Tensor,
+    targets_cls: torch.Tensor,
+    ce_fn: CrossEntropyLoss,
+    alpha: float = 0.5,
+) -> torch.Tensor:
+    """
+    Combined weighted CE + Dice loss.
+
+    CE handles hard misclassifications via class weights.
+    Dice improves boundary precision and minority class recall.
+
+    Args:
+        outputs:     Raw model logits (B, C, H, W).
+        targets_cls: Integer class indices (B, H, W).
+        ce_fn:       Pre-built CrossEntropyLoss with class weights.
+        alpha:       Weight for CE term (1-alpha goes to Dice).
+
+    Returns:
+        Scalar combined loss.
+    """
+    ce   = ce_fn(outputs, targets_cls)
+    dice = dice_loss(outputs, targets_cls)
+    return alpha * ce + (1.0 - alpha) * dice
+
+
+# ── Training / validation loops ───────────────────────────────────────────────
+
+def train_one_epoch(
+    model, loader, optimizer, ce_fn, device, epoch, total_epochs
+):
+    """
+    Train for one epoch using combined CE + Dice loss.
 
     Returns:
         Average training loss for the epoch.
@@ -55,12 +132,11 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epoc
         images  = images.to(device)
         targets = targets.to(device)
 
-        # Convert RGB float labels -> integer class indices (B, H, W)
-        targets_cls = rgb_label_to_class_index(targets)
+        targets_cls = rgb_label_to_class_index(targets)   # (B, H, W) int
 
         optimizer.zero_grad()
-        outputs = model(images)                  # (B, 3, H, W) logits
-        loss    = loss_fn(outputs, targets_cls)  # weighted CE on integer targets
+        outputs = model(images)
+        loss    = combined_loss(outputs, targets_cls, ce_fn)
         loss.backward()
         optimizer.step()
 
@@ -70,9 +146,9 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epoc
 
 
 @torch.no_grad()
-def validate(model, loader, loss_fn, device, epoch, total_epochs):
+def validate(model, loader, ce_fn, device, epoch, total_epochs):
     """
-    Evaluate the model on the validation set.
+    Evaluate on the validation set.
 
     Returns:
         Tuple (avg_val_loss, metrics_dict)
@@ -88,20 +164,22 @@ def validate(model, loader, loss_fn, device, epoch, total_epochs):
         targets_cls = rgb_label_to_class_index(targets)
 
         outputs = model(images)
-        loss    = loss_fn(outputs, targets_cls)
+        loss    = combined_loss(outputs, targets_cls, ce_fn)
         running_loss += loss.item()
 
-        # SegmentationMetrics.update() accepts the original float RGB labels
         metrics.update(outputs, targets)
 
-    avg_loss       = running_loss / len(loader)
-    metric_results = metrics.compute()
-    return avg_loss, metric_results
+    return running_loss / len(loader), metrics.compute()
 
+
+# ── Main training loop ────────────────────────────────────────────────────────
 
 def train(config: dict) -> None:
     """
-    Full training loop with weighted CrossEntropyLoss and ReduceLROnPlateau.
+    Full training loop:
+      - Combined CE + Dice loss with class weights
+      - CosineAnnealingLR for smooth, noise-independent LR decay
+      - Best checkpoint saved on val mIoU
     """
     logger.info("=" * 60)
     logger.info("  Drivable Area Detection - Training Started")
@@ -109,61 +187,62 @@ def train(config: dict) -> None:
 
     device = get_device(config["inference"]["device"])
 
-    # Data
+    # ── Data ─────────────────────────────────────────────────────────────────
     train_loader, val_loader, n_samples = build_dataloaders(config)
 
-    # Model
+    # ── Model ─────────────────────────────────────────────────────────────────
     model = build_model(config)
     model.to(device)
 
-    # Optimiser
+    # ── Optimiser ─────────────────────────────────────────────────────────────
     lr        = config["training"]["learning_rate"]
     optimizer = Adam(model.parameters(), lr=lr)
 
-    # Weighted CrossEntropyLoss
+    # ── Loss — weighted CE (for class imbalance) + Dice (for IoU optimisation)
     # Weight order: [Drivable(0), Background(1), Adjacent(2)]
-    # Background fills ~83% of pixels; without weights the model collapses
-    # to predicting background everywhere giving 0% on Drivable and Adjacent.
-    class_weights = torch.tensor([4.0, 1.0, 12.0], device=device)
-    loss_fn       = CrossEntropyLoss(weight=class_weights)
+    # Background fills ~83% of pixels; without weights the model predicts only BG.
+    # Drivable raised to 5.0 (was 4.0) after observing it underperform vs BG.
+    # Adjacent kept at 12.0 — was already learning well at that weight.
+    class_weights = torch.tensor([5.0, 1.0, 12.0], device=device)
+    ce_fn         = CrossEntropyLoss(weight=class_weights)
 
     logger.info(
-        "Loss: weighted CrossEntropyLoss  "
-        "weights=[Drivable=4.0, Background=1.0, Adjacent=8.0]"
+        "Loss: 0.5 * weighted_CE + 0.5 * Dice  |  "
+        "CE weights=[Drivable=5.0, Background=1.0, Adjacent=12.0]"
     )
 
-    # LR scheduler - halves lr if mIoU doesn't improve for 3 epochs
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=5,
-        min_lr=1e-6,
-    )
-
+    # ── Scheduler — CosineAnnealingLR ─────────────────────────────────────────
+    # Decays lr smoothly from `lr` to `eta_min` over `T_max` epochs.
+    # Unlike ReduceLROnPlateau, this is independent of the noisy mIoU signal,
+    # so it won't cut lr prematurely when mIoU oscillates on small val sets.
     epochs    = config["training"]["epochs"]
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,
+        eta_min=1e-6,
+    )
+
     ckpt_path = config["paths"]["model_checkpoint"]
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
     best_miou = 0.0
-    prev_lr   = lr
 
-    logger.info(f"Training {n_samples} samples | {epochs} epochs | lr={lr} | device={device}")
+    logger.info(
+        f"Training {n_samples} samples | {epochs} epochs | "
+        f"lr={lr} (cosine decay) | device={device}"
+    )
 
     for epoch in range(epochs):
         t0 = time.time()
 
-        train_loss               = train_one_epoch(model, train_loader, optimizer, loss_fn, device, epoch, epochs)
-        val_loss, metric_results = validate(model, val_loader, loss_fn, device, epoch, epochs)
+        train_loss               = train_one_epoch(model, train_loader, optimizer, ce_fn, device, epoch, epochs)
+        val_loss, metric_results = validate(model, val_loader, ce_fn, device, epoch, epochs)
         miou                     = metric_results["miou"]
         elapsed                  = time.time() - t0
 
-        scheduler.step(miou)
+        # Step cosine scheduler once per epoch (not tied to mIoU)
+        scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
-
-        if current_lr < prev_lr:
-            logger.info(f"  LR reduced: {prev_lr:.6f} -> {current_lr:.6f}")
-            prev_lr = current_lr
 
         logger.info(
             f"Epoch [{epoch+1:3d}/{epochs}]  "
